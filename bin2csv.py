@@ -2,12 +2,16 @@
 """
 Конвертер осциллограмм AKTAKOM / АКИП ADS-2061M  (.bin -> CSV + PNG).
 
-Формат (вскрыт по эталону-меандру 5 В / 1 кГц, 2 В/дел, 1 мс/дел):
+Формат (вскрыт по эталону-меандру 1 кГц):
   * магия: "SPBS01e\\0"
   * заголовок ~113 байт, полезная нагрузка (отсчёты) начинается с offset 0x71
   * по умолчанию 1 байт = 1 отсчёт, 1000 отсчётов
-  * 1 код = 0.1 деления по вертикали  ->  вольт = код * 0.1 * (В/дел)
+  * по умолчанию 25 кодов = 1 деление по вертикали  ->  вольт = код / 25 * (В/дел)
+    (число кодов на деление при необходимости задаётся полем "Кодов на деление")
   * значения знаковые: код 255 = -1 (всплески ниже нуля)
+  * "отсчётов на деление" не вводится вручную, а считается: (Время/деление) × Частота дискретизации
+  * в CSV, кроме монотонного time_ms, есть расходящийся ряд time_rel_us:
+    0 в центре записи (отсчёт N/2), отрицательные до него, положительные после
 
 Запуск GUI:      python bin2csv.py
 Запуск без GUI:  python bin2csv.py <файл.bin> <В/дел> <время/дел> [отсч/дел] [смещ/дел]
@@ -23,6 +27,7 @@ import collections
 
 PAYLOAD_OFFSET = 0x71
 MAGIC = b"SPBS01e\x00"
+CODES_PER_DIV = 25.0   # кодов АЦП на одно вертикальное деление
 
 VDIV_VALUES = ["1 mV", "2 mV", "5 mV", "10 mV", "20 mV", "50 mV",
                "100 mV", "200 mV", "500 mV", "1 V", "2 V", "5 V", "10 V"]
@@ -54,6 +59,29 @@ def parse_scale(text):
     if unit not in _UNITS:
         raise ValueError("неизвестная единица: %r" % m.group(2))
     return num * _UNITS[unit]
+
+
+def parse_count(text):
+    """Число отсчётов из строки: '1K' -> 1000 ; '10k' -> 10000 ; '1000' -> 1000 ; '' -> 0."""
+    s = str(text).strip().replace(",", ".").replace(" ", "").upper()
+    if not s:
+        return 0
+    mult = 1
+    if s.endswith("K"):
+        mult, s = 1000, s[:-1]
+    elif s.endswith("M"):
+        mult, s = 1000000, s[:-1]
+    return int(round(float(s) * mult))
+
+
+def parse_rate(text):
+    """Частота дискретизации в Гц: '100k' -> 1e5 ; '100 kSa/s' -> 1e5 ; '100000' -> 1e5 ; '1M' -> 1e6."""
+    s = str(text).strip().replace(",", ".").replace(" ", "").lower()
+    m = re.match(r"^([0-9]*\.?[0-9]+)\s*([kmg]?)", s)
+    if not m:
+        raise ValueError("не разобрать частоту: %r" % text)
+    mult = {"": 1.0, "k": 1e3, "m": 1e6, "g": 1e9}[m.group(2)]
+    return float(m.group(1)) * mult
 
 
 def signed8(v):
@@ -115,9 +143,9 @@ def write_csv(path, notes, rows):
     with open(path, "w", newline="", encoding="utf-8") as f:
         for l in notes:
             f.write("# " + l + "\n")
-        f.write("# index;time_ms;code;volts\n")
-        for i, t_ms, code, volts in rows:
-            f.write("%d;%.4f;%d;%.6g\n" % (i, t_ms, code, volts))
+        f.write("# index;time_ms;code;volts;time_rel_us\n")
+        for i, t_ms, code, volts, t_rel_us in rows:
+            f.write("%d;%.4f;%d;%.6g;%.4f\n" % (i, t_ms, code, volts, t_rel_us))
 
 
 def write_png(path, series, W=1000, H=340, margin=18, xgrid=50):
@@ -188,20 +216,24 @@ def unique_base(base):
 
 def convert(path, vdiv, tdiv, spd=50.0, offset_div=0.0, out_base=None,
             data_offset=PAYLOAD_OFFSET, bps=1, count=0, signed=True,
-            probe=1.0, make_png=True):
+            probe=1.0, make_png=True, codes_per_div=CODES_PER_DIV,
+            zero_index=None):
     info = read_bin(path)
     samples, kind = extract_samples(info["raw"], data_offset, bps, count, signed)
     if not samples:
         raise ValueError("не выделено ни одного отсчёта (проверьте offset/размер)")
 
-    dt_us = (tdiv / spd) * 1e6              # мкс/отсчёт
-    volts_per_code = 0.1 * vdiv * probe     # 1 код = 0.1 деления
-    zero = offset_div * 10.0                # смещение нуля в кодах
+    dt_us = (tdiv / spd) * 1e6                        # мкс/отсчёт
+    volts_per_code = vdiv / codes_per_div * probe     # В на 1 код
+    zero = offset_div * codes_per_div                 # смещение нуля в кодах
+
+    n = len(samples)
+    zc = n // 2 if zero_index is None else int(zero_index)   # отсчёт t = 0 (по умолчанию центр записи)
 
     rows = []
     for i, c in enumerate(samples):
         v = (c - zero) * volts_per_code
-        rows.append((i, i * dt_us / 1000.0, c, v))
+        rows.append((i, i * dt_us / 1000.0, c, v, (i - zc) * dt_us))
     volts = [r[3] for r in rows]
 
     if out_base is None:
@@ -218,23 +250,26 @@ def convert(path, vdiv, tdiv, spd=50.0, offset_div=0.0, out_base=None,
         "Прибор: %s, канал %s" % (info["model"], info["channel"]),
         "Отсчётов: %d (%s), смещение данных 0x%X, байт/отсчёт %d"
         % (len(samples), kind, data_offset, bps),
-        "Вертикаль: %.6g В/дел, 1 код = 0.1 дел => %.6g В/код, смещение %.3g дел, щуп x%.6g"
-        % (vdiv, volts_per_code, offset_div, probe),
+        "Вертикаль: %.6g В/дел, %.6g кодов/дел => %.6g В/код, смещение %.3g дел, щуп x%.6g"
+        % (vdiv, codes_per_div, volts_per_code, offset_div, probe),
         "Горизонталь: %.6g с/дел, %.6g отсч/дел => dt = %.6g мкс (запись %.6g мс)"
         % (tdiv, spd, dt_us, len(samples) * dt_us / 1000.0),
         "Заголовок: %s" % ", ".join("%s=%s" % (k, hdr[k]) for k in hdr),
-        "Колонки: index; time_ms; code (сырой код); volts (В)",
+        "Колонки: index; time_ms (от начала записи, 0..N*dt); code (сырой код); volts (В); "
+        "time_rel_us (мкс, расходящийся ряд: 0 в центре записи)",
+        "Ноль времени (time_rel_us = 0): отсчёт %d из %d (центр записи)" % (zc, n),
     ]
     write_csv(csv_path, notes, rows)
     if make_png:
         write_png(png_path, volts)
 
-    hist = collections.Counter(c for _, _, c, _ in rows)
+    hist = collections.Counter(c for _, _, c, _, _ in rows)
     return {
         "info": info, "samples": samples, "volts": volts, "rows": rows,
         "csv": csv_path, "png": png_path if make_png else None,
         "dt_us": dt_us, "volts_per_code": volts_per_code,
         "hist": hist, "vmin": min(volts), "vmax": max(volts),
+        "zero_index": zc,
     }
 
 
@@ -247,16 +282,19 @@ def run_gui():
 
     root = tk.Tk()
     root.title("ADS-2061M .bin -> CSV + PNG")
-    root.geometry("860x640")
+    root.geometry("1040x880")
+    root.minsize(900, 780)
 
     v_file = tk.StringVar()
     v_vdiv = tk.StringVar(value="2 V")
     v_tdiv = tk.StringVar(value="1 ms")
-    v_spd = tk.StringVar(value="50")
+    v_spd = tk.StringVar()                  # отсчётов на деление (вычисляется)
+    v_fs = tk.StringVar(value="100k")       # частота дискретизации, Са/с (можно 100k, 100000)
+    v_depth = tk.StringVar(value="1K")      # глубина записи, отсчётов (можно 1K, 1000)
+    v_cpd = tk.StringVar(value="25")
     v_ofs = tk.StringVar(value="0")
     v_off = tk.StringVar(value=str(PAYLOAD_OFFSET))
     v_bps = tk.StringVar(value="1")
-    v_cnt = tk.StringVar(value="0")
     v_sgn = tk.BooleanVar(value=True)
     v_probe = tk.StringVar(value="1")
     v_png = tk.BooleanVar(value=True)
@@ -327,15 +365,32 @@ def run_gui():
     row(cfrm, "Вольт/деление:", cb_v, 0)
     cb_t = ttk.Combobox(cfrm, textvariable=v_tdiv, values=TDIV_VALUES, width=12)
     row(cfrm, "Время/деление:", cb_t, 1)
-    row(cfrm, "Отсчётов на деление:", ttk.Entry(cfrm, textvariable=v_spd, width=12), 2)
-    row(cfrm, "Смещение, делений (офсет):", ttk.Entry(cfrm, textvariable=v_ofs, width=12), 3)
-    row(cfrm, "Множитель щупа (x):", ttk.Entry(cfrm, textvariable=v_probe, width=12), 4)
+    row(cfrm, "Частота дискретизации (Са/с):", ttk.Entry(cfrm, textvariable=v_fs, width=12), 2)
+    row(cfrm, "Глубина записи (отсчётов):", ttk.Entry(cfrm, textvariable=v_depth, width=12), 3)
+    ttk.Label(cfrm, text="Отсчётов на деление:").grid(row=4, column=0, sticky="w", padx=4, pady=3)
+    ttk.Label(cfrm, textvariable=v_spd, foreground="#555").grid(row=4, column=1, sticky="w", padx=4, pady=3)
+    row(cfrm, "Кодов на деление:", ttk.Entry(cfrm, textvariable=v_cpd, width=12), 5)
+    row(cfrm, "Смещение, делений (офсет):", ttk.Entry(cfrm, textvariable=v_ofs, width=12), 6)
+    row(cfrm, "Множитель щупа (x):", ttk.Entry(cfrm, textvariable=v_probe, width=12), 7)
 
     hint = ttk.Label(cfrm, foreground="#555", text=(
-        "dt = (Время/деление) / (отсчётов на деление).   "
-        "Для эталона: 1 ms / 50 = 20 мкс/отсчёт.\n"
-        "volts = (код - смещение*10) * 0.1 * (В/дел) * щуп"))
-    hint.grid(row=5, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 2))
+        "Отсчётов на деление считается само: (Время/деление) × (Частота дискретизации).   "
+        "Пример: 500 us × 100k = 50 отсч/дел.\n"
+        "Частота: пишите 100k (=100 кСа/с) или 100000.  Глубина: 1K = 1000 отсчётов.\n"
+        "volts = (код - офсет*кодов_на_дел) / кодов_на_дел * (В/дел) * щуп"))
+    hint.grid(row=8, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 2))
+
+    def sync_spd(*_):
+        """Показывает вычисленные отсчёты на деление по мере ввода."""
+        try:
+            tdiv = parse_scale(v_tdiv.get())
+            fs = parse_rate(v_fs.get())
+            v_spd.set("%.6g" % (tdiv * fs))
+        except Exception:
+            v_spd.set("—")
+    for _v in (v_tdiv, v_fs):
+        _v.trace_add("write", sync_spd)
+    sync_spd()
 
     # -- дополнительные параметры формата --
     afrm = ttk.LabelFrame(root, text="3. Формат данных (нужно, если файл отличается)")
@@ -345,9 +400,7 @@ def run_gui():
     ttk.Label(afrm, text="Байт/отсчёт:").grid(row=0, column=2, sticky="w", padx=6)
     ttk.Combobox(afrm, textvariable=v_bps, values=["1", "2"], width=4)\
         .grid(row=0, column=3, sticky="w")
-    ttk.Label(afrm, text="Отсчётов (0 = авто):").grid(row=0, column=4, sticky="w", padx=6)
-    ttk.Entry(afrm, textvariable=v_cnt, width=8).grid(row=0, column=5, sticky="w")
-    ttk.Checkbutton(afrm, text="знаковый", variable=v_sgn).grid(row=0, column=6, sticky="w", padx=6)
+    ttk.Checkbutton(afrm, text="знаковый", variable=v_sgn).grid(row=0, column=4, sticky="w", padx=6)
     ttk.Checkbutton(afrm, text="строить PNG", variable=v_png).grid(row=1, column=0, columnspan=2,
                                                                    sticky="w", padx=4, pady=(4, 2))
     ttk.Label(afrm, text="Имя для выходных файлов (без расширения):")\
@@ -370,20 +423,25 @@ def run_gui():
             base = os.path.join(os.path.dirname(os.path.abspath(p)), base)
         try:
             off = int(str(v_off.get()).strip(), 0)
+            tdiv = parse_scale(v_tdiv.get())
+            spd = tdiv * parse_rate(v_fs.get())          # отсчётов на деление = Время/дел × Fs
+            depth = parse_count(v_depth.get())           # глубина записи, отсчётов
             res = convert(
                 p,
-                parse_scale(v_vdiv.get()), parse_scale(v_tdiv.get()),
-                float(str(v_spd.get()).replace(",", ".")),
+                parse_scale(v_vdiv.get()), tdiv, spd,
                 float(str(v_ofs.get()).replace(",", ".")),
                 out_base=base,
                 data_offset=off, bps=int(v_bps.get()),
-                count=int(v_cnt.get() or 0), signed=bool(v_sgn.get()),
+                count=depth, signed=bool(v_sgn.get()),
                 probe=float(str(v_probe.get()).replace(",", ".")),
+                codes_per_div=float(str(v_cpd.get()).replace(",", ".")),
                 make_png=make_png)
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
             return
         txt.insert("end", "\n--- ГОТОВО ---\n")
+        txt.insert("end", "отсчётов на деление: %.6g (Время/дел %.6g с × Fs %s)\n"
+                   % (spd, tdiv, v_fs.get()))
         used = os.path.splitext(res["csv"])[0]
         if os.path.normcase(used) != os.path.normcase(base):
             txt.insert("end", "имя %s уже было занято -> сохранено как %s\n"
@@ -396,6 +454,8 @@ def run_gui():
                    % ", ".join("%d×%d" % (v, n) for v, n in res["hist"].most_common(10)))
         txt.insert("end", "первые 12 значений: %s\n"
                    % ", ".join("%.4g" % x for x in res["volts"][:12]))
+        txt.insert("end", "ноль времени (time_rel_us=0): отсчёт %d из %d\n"
+                   % (res["zero_index"], len(res["samples"])))
         txt.insert("end", "CSV: %s\n" % res["csv"])
         if res["png"]:
             txt.insert("end", "PNG: %s\n" % res["png"])
@@ -403,7 +463,7 @@ def run_gui():
 
     ttk.Button(bfrm, text="Декодировать в CSV + PNG", command=do_convert)\
         .pack(side="left", padx=4)
-    ttk.Label(bfrm, foreground="#555",
+    ttk.Label(bfrm, foreground="#555", wraplength=980, justify="left",
               text="Совет: если коды «схлопнуты» в 1-2 значения — увеличьте чувствительность (меньше В/дел) на приборе.")\
         .pack(side="left", padx=10)
 
